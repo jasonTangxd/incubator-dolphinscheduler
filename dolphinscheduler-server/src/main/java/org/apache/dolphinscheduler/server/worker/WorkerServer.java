@@ -22,31 +22,35 @@ import org.apache.dolphinscheduler.common.Constants;
 import org.apache.dolphinscheduler.common.IStoppable;
 import org.apache.dolphinscheduler.common.enums.ExecutionStatus;
 import org.apache.dolphinscheduler.common.enums.TaskType;
-import org.apache.dolphinscheduler.common.queue.ITaskQueue;
-import org.apache.dolphinscheduler.common.queue.TaskQueueFactory;
 import org.apache.dolphinscheduler.common.thread.Stopper;
 import org.apache.dolphinscheduler.common.thread.ThreadPoolExecutors;
 import org.apache.dolphinscheduler.common.thread.ThreadUtils;
 import org.apache.dolphinscheduler.common.utils.CollectionUtils;
 import org.apache.dolphinscheduler.common.utils.OSUtils;
-import org.apache.dolphinscheduler.common.utils.SpringApplicationContext;
-import org.apache.dolphinscheduler.common.zk.AbstractZKClient;
 import org.apache.dolphinscheduler.dao.AlertDao;
-import org.apache.dolphinscheduler.dao.ProcessDao;
 import org.apache.dolphinscheduler.dao.entity.TaskInstance;
+import org.apache.dolphinscheduler.server.master.MasterServer;
 import org.apache.dolphinscheduler.server.utils.ProcessUtils;
 import org.apache.dolphinscheduler.server.worker.config.WorkerConfig;
 import org.apache.dolphinscheduler.server.worker.runner.FetchTaskThread;
 import org.apache.dolphinscheduler.server.zk.ZKWorkerClient;
+import org.apache.dolphinscheduler.service.bean.SpringApplicationContext;
+import org.apache.dolphinscheduler.service.process.ProcessService;
+import org.apache.dolphinscheduler.service.queue.ITaskQueue;
+import org.apache.dolphinscheduler.service.queue.TaskQueueFactory;
+import org.apache.dolphinscheduler.service.zk.AbstractZKClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.annotation.ComponentScan;
+import org.springframework.context.annotation.FilterType;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -56,7 +60,10 @@ import java.util.concurrent.TimeUnit;
 /**
  *  worker server
  */
-@ComponentScan("org.apache.dolphinscheduler")
+@SpringBootApplication
+@ComponentScan(value = "org.apache.dolphinscheduler", excludeFilters = {
+        @ComponentScan.Filter(type = FilterType.ASSIGNABLE_TYPE, classes = {MasterServer.class})
+})
 public class WorkerServer implements IStoppable {
 
     /**
@@ -73,10 +80,10 @@ public class WorkerServer implements IStoppable {
 
 
     /**
-     *  process database access
+     *  process service
      */
     @Autowired
-    private ProcessDao processDao;
+    private ProcessService processService;
 
     /**
      *  alert database access
@@ -104,23 +111,18 @@ public class WorkerServer implements IStoppable {
      */
     private ExecutorService fetchTaskExecutorService;
 
+    @Value("${server.is-combined-server:false}")
+    private Boolean isCombinedServer;
+
+    @Autowired
+    private WorkerConfig workerConfig;
+
     /**
      *  spring application context
      *  only use it for initialization
      */
     @Autowired
     private SpringApplicationContext springApplicationContext;
-
-    /**
-     * CountDownLatch latch
-     */
-    private CountDownLatch latch;
-
-    @Value("${server.is-combined-server:false}")
-    private Boolean isCombinedServer;
-
-    @Autowired
-    private WorkerConfig workerConfig;
 
     /**
      * master server startup
@@ -149,7 +151,7 @@ public class WorkerServer implements IStoppable {
 
         this.fetchTaskExecutorService = ThreadUtils.newDaemonSingleThreadExecutor("Worker-Fetch-Thread-Executor");
 
-        heartbeatWorkerService = ThreadUtils.newDaemonThreadScheduledExecutor("Worker-Heartbeat-Thread-Executor", Constants.defaulWorkerHeartbeatThreadNum);
+        heartbeatWorkerService = ThreadUtils.newThreadScheduledExecutor("Worker-Heartbeat-Thread-Executor", Constants.DEFAUL_WORKER_HEARTBEAT_THREAD_NUM, false);
 
         // heartbeat thread implement
         Runnable heartBeatThread = heartBeatThread();
@@ -167,33 +169,19 @@ public class WorkerServer implements IStoppable {
         killExecutorService.execute(killProcessThread);
 
         // new fetch task thread
-        FetchTaskThread fetchTaskThread = new FetchTaskThread(zkWorkerClient, processDao, taskQueue);
+        FetchTaskThread fetchTaskThread = new FetchTaskThread(zkWorkerClient, processService, taskQueue);
 
         // submit fetch task thread
         fetchTaskExecutorService.execute(fetchTaskThread);
+    }
 
-        /**
-         * register hooks, which are called before the process exits
-         */
-        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-            @Override
-            public void run() {
-                // worker server exit alert
-                if (zkWorkerClient.getActiveMasterNum() <= 1) {
-                    alertDao.sendServerStopedAlert(1, OSUtils.getHost(), "Worker-Server");
-                }
-                stop("shutdownhook");
-            }
-        }));
-
-        //let the main thread await
-        latch = new CountDownLatch(1);
-        if (!isCombinedServer) {
-            try {
-                latch.await();
-            } catch (InterruptedException ignore) {
-            }
+    @PreDestroy
+    public void destroy() {
+        // worker server exit alert
+        if (zkWorkerClient.getActiveMasterNum() <= 1) {
+            alertDao.sendServerStopedAlert(1, OSUtils.getHost(), "Worker-Server");
         }
+        stop("shutdownhook");
     }
 
     @Override
@@ -201,7 +189,7 @@ public class WorkerServer implements IStoppable {
 
         try {
             //execute only once
-            if(Stopper.isStoped()){
+            if(Stopper.isStopped()){
                 return;
             }
 
@@ -251,7 +239,6 @@ public class WorkerServer implements IStoppable {
             }catch (Exception e){
                 logger.warn("zookeeper service stopped exception:{}",e.getMessage());
             }
-            latch.countDown();
             logger.info("zookeeper service stopped");
 
         } catch (Exception e) {
@@ -297,7 +284,7 @@ public class WorkerServer implements IStoppable {
                     Set<String> taskInfoSet = taskQueue.smembers(Constants.DOLPHINSCHEDULER_TASKS_KILL);
                     if (CollectionUtils.isNotEmpty(taskInfoSet)){
                         for (String taskInfo : taskInfoSet){
-                            killTask(taskInfo, processDao);
+                            killTask(taskInfo, processService);
                             removeKillInfoFromQueue(taskInfo);
                         }
                     }
@@ -319,7 +306,7 @@ public class WorkerServer implements IStoppable {
      * @param taskInfo  task info
      * @param pd        process dao
      */
-    private void killTask(String taskInfo, ProcessDao pd) {
+    private void killTask(String taskInfo, ProcessService pd) {
         logger.info("get one kill command from tasks kill queue: " + taskInfo);
         String[] taskInfoArray = taskInfo.split("-");
         if(taskInfoArray.length != 2){
@@ -357,7 +344,7 @@ public class WorkerServer implements IStoppable {
      * @param taskInstance
      * @param pd process dao
      */
-    private void deleteTaskFromQueue(TaskInstance taskInstance, ProcessDao pd){
+    private void deleteTaskFromQueue(TaskInstance taskInstance, ProcessService pd){
         // creating distributed locks, lock path /dolphinscheduler/lock/worker
         InterProcessMutex mutex = null;
         logger.info("delete task from tasks queue: " + taskInstance.getId());

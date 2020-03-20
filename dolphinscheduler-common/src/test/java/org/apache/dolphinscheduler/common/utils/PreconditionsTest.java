@@ -35,7 +35,7 @@ public class PreconditionsTest {
     public void testCheckNotNull() throws Exception {
         String testReference = "test reference";
         //test  reference is not null
-        Assert.assertEquals(testReference,Preconditions.checkNotNull(testReference));
+        Assert.assertEquals(testReference, Preconditions.checkNotNull(testReference));
         Assert.assertEquals(testReference,Preconditions.checkNotNull(testReference,"reference is null"));
         Assert.assertEquals(testReference,Preconditions.checkNotNull(testReference,"%s is null",testReference));
 

@@ -18,17 +18,19 @@ package org.apache.dolphinscheduler.server.worker.runner;
 
 import org.apache.curator.framework.recipes.locks.InterProcessMutex;
 import org.apache.dolphinscheduler.common.Constants;
-import org.apache.dolphinscheduler.common.queue.ITaskQueue;
+import org.apache.dolphinscheduler.common.enums.ExecutionStatus;
 import org.apache.dolphinscheduler.common.thread.Stopper;
 import org.apache.dolphinscheduler.common.thread.ThreadUtils;
 import org.apache.dolphinscheduler.common.utils.*;
-import org.apache.dolphinscheduler.common.zk.AbstractZKClient;
-import org.apache.dolphinscheduler.dao.ProcessDao;
 import org.apache.dolphinscheduler.dao.entity.TaskInstance;
 import org.apache.dolphinscheduler.dao.entity.Tenant;
 import org.apache.dolphinscheduler.dao.entity.WorkerGroup;
 import org.apache.dolphinscheduler.server.worker.config.WorkerConfig;
 import org.apache.dolphinscheduler.server.zk.ZKWorkerClient;
+import org.apache.dolphinscheduler.service.bean.SpringApplicationContext;
+import org.apache.dolphinscheduler.service.process.ProcessService;
+import org.apache.dolphinscheduler.service.queue.ITaskQueue;
+import org.apache.dolphinscheduler.service.zk.AbstractZKClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,7 +64,7 @@ public class FetchTaskThread implements Runnable{
     /**
      *  process database access
      */
-    private final ProcessDao processDao;
+    private final ProcessService processService;
 
     /**
      *  worker thread pool executor
@@ -90,10 +92,10 @@ public class FetchTaskThread implements Runnable{
     private WorkerConfig workerConfig;
 
     public FetchTaskThread(ZKWorkerClient zkWorkerClient,
-                           ProcessDao processDao,
+                           ProcessService processService,
                            ITaskQueue taskQueue){
         this.zkWorkerClient = zkWorkerClient;
-        this.processDao = processDao;
+        this.processService = processService;
         this.taskQueue = taskQueue;
         this.workerConfig = SpringApplicationContext.getBean(WorkerConfig.class);
         this.taskNum = workerConfig.getWorkerFetchTaskNum();
@@ -111,12 +113,12 @@ public class FetchTaskThread implements Runnable{
      */
     private boolean checkWorkerGroup(TaskInstance taskInstance, String host){
 
-        int taskWorkerGroupId = processDao.getTaskWorkerGroupId(taskInstance);
+        int taskWorkerGroupId = processService.getTaskWorkerGroupId(taskInstance);
 
         if(taskWorkerGroupId <= 0){
             return true;
         }
-        WorkerGroup workerGroup = processDao.queryWorkerGroupById(taskWorkerGroupId);
+        WorkerGroup workerGroup = processService.queryWorkerGroupById(taskWorkerGroupId);
         if(workerGroup == null ){
             logger.info("task {} cannot find the worker group, use all worker instead.", taskInstance.getId());
             return true;
@@ -139,6 +141,7 @@ public class FetchTaskThread implements Runnable{
         logger.info("worker start fetch tasks...");
         while (Stopper.isRunning()){
             InterProcessMutex mutex = null;
+            String currentTaskQueueStr = null;
             try {
                 ThreadPoolExecutor poolExecutor = (ThreadPoolExecutor) workerExecService;
                 //check memory and cpu usage and threads
@@ -165,6 +168,9 @@ public class FetchTaskThread implements Runnable{
                 List<String> taskQueueStrArr = taskQueue.poll(Constants.DOLPHINSCHEDULER_TASKS_QUEUE, taskNum);
 
                 for(String taskQueueStr : taskQueueStrArr){
+
+                    currentTaskQueueStr = taskQueueStr;
+
                     if (StringUtils.isEmpty(taskQueueStr)) {
                         continue;
                     }
@@ -179,12 +185,12 @@ public class FetchTaskThread implements Runnable{
                     // mainly to wait for the master insert task to succeed
                     waitForTaskInstance();
 
-                    taskInstance = processDao.getTaskInstanceDetailByTaskId(taskInstId);
+                    taskInstance = processService.getTaskInstanceDetailByTaskId(taskInstId);
 
                     // verify task instance is null
                     if (verifyTaskInstanceIsNull(taskInstance)) {
                         logger.warn("remove task queue : {} due to taskInstance is null", taskQueueStr);
-                        removeNodeFromTaskQueue(taskQueueStr);
+                        processErrorTask(taskQueueStr);
                         continue;
                     }
 
@@ -192,18 +198,22 @@ public class FetchTaskThread implements Runnable{
                         continue;
                     }
 
-                    Tenant tenant = processDao.getTenantForProcess(taskInstance.getProcessInstance().getTenantId(),
-                            taskInstance.getProcessDefine().getUserId());
+                    // if process definition is null ,process definition already deleted
+                    int userId = taskInstance.getProcessDefine() == null ? 0 : taskInstance.getProcessDefine().getUserId();
+
+                    Tenant tenant = processService.getTenantForProcess(
+                            taskInstance.getProcessInstance().getTenantId(),
+                            userId);
 
                     // verify tenant is null
                     if (verifyTenantIsNull(tenant)) {
                         logger.warn("remove task queue : {} due to tenant is null", taskQueueStr);
-                        removeNodeFromTaskQueue(taskQueueStr);
+                        processErrorTask(taskQueueStr);
                         continue;
                     }
 
                     // set queue for process instance, user-specified queue takes precedence over tenant queue
-                    String userQueue = processDao.queryUserQueueByProcessInstanceId(taskInstance.getProcessInstanceId());
+                    String userQueue = processService.queryUserQueueByProcessInstanceId(taskInstance.getProcessInstanceId());
                     taskInstance.getProcessInstance().setQueue(StringUtils.isEmpty(userQueue) ? tenant.getQueue() : userQueue);
                     taskInstance.getProcessInstance().setTenantCode(tenant.getTenantCode());
 
@@ -225,18 +235,39 @@ public class FetchTaskThread implements Runnable{
 
                     logger.info("task : {} ready to submit to task scheduler thread",taskInstId);
                     // submit task
-                    workerExecService.submit(new TaskScheduleThread(taskInstance, processDao));
+                    workerExecService.submit(new TaskScheduleThread(taskInstance, processService));
 
                     // remove node from zk
                     removeNodeFromTaskQueue(taskQueueStr);
                 }
 
             }catch (Exception e){
+                processErrorTask(currentTaskQueueStr);
                 logger.error("fetch task thread failure" ,e);
             }finally {
                 AbstractZKClient.releaseMutex(mutex);
             }
         }
+    }
+
+    /**
+     * process error task
+     *
+     * @param taskQueueStr task queue str
+     */
+    private void processErrorTask(String taskQueueStr){
+        // remove from zk
+        removeNodeFromTaskQueue(taskQueueStr);
+
+        if (taskInstance != null){
+            processService.changeTaskState(ExecutionStatus.FAILURE,
+                    taskInstance.getStartTime(),
+                    taskInstance.getHost(),
+                    null,
+                    null,
+                    taskInstId);
+        }
+
     }
 
     /**
@@ -269,8 +300,7 @@ public class FetchTaskThread implements Runnable{
      */
     private boolean verifyTenantIsNull(Tenant tenant) {
         if(tenant == null){
-            logger.error("tenant not exists,process define id : {},process instance id : {},task instance id : {}",
-                    taskInstance.getProcessDefine().getId(),
+            logger.error("tenant not exists,process instance id : {},task instance id : {}",
                     taskInstance.getProcessInstance().getId(),
                     taskInstance.getId());
             return true;
@@ -318,7 +348,7 @@ public class FetchTaskThread implements Runnable{
         int retryTimes = 30;
         while (taskInstance == null && retryTimes > 0) {
             Thread.sleep(Constants.SLEEP_TIME_MILLIS);
-            taskInstance = processDao.findTaskInstanceById(taskInstId);
+            taskInstance = processService.findTaskInstanceById(taskInstId);
             retryTimes--;
         }
     }

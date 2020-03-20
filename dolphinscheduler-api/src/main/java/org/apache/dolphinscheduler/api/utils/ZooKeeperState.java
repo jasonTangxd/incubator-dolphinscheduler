@@ -121,7 +121,7 @@ public class ZooKeeperState {
 	private class SendThread extends Thread {
 		private String cmd;
 
-		public String ret = "";
+		private String ret = "";
 
 		public SendThread(String cmd) {
 			this.cmd = cmd;
@@ -145,7 +145,7 @@ public class ZooKeeperState {
 		sendThread.setName("FourLetterCmd:" + cmd);
 		sendThread.start();
 		try {
-			sendThread.join(waitTimeout * 1000);
+			sendThread.join(waitTimeout * 1000L);
 			return sendThread.ret;
 		} catch (InterruptedException e) {
 			logger.error("send " + cmd + " to server " + host + ":" + port + " failed!", e);

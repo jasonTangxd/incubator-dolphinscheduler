@@ -96,7 +96,13 @@ public class DagHelper {
             for (String startNodeName : startNodeList) {
                 TaskNode startNode = findNodeByName(taskNodeList, startNodeName);
                 List<TaskNode> childNodeList = new ArrayList<>();
-                if (TaskDependType.TASK_POST == taskDependType) {
+                if (startNode == null) {
+                    logger.error("start node name [{}] is not in task node list [{}] ",
+                        startNodeName,
+                        taskNodeList
+                    );
+                    continue;
+                } else if (TaskDependType.TASK_POST == taskDependType) {
                     childNodeList = getFlowNodeListPost(startNode, taskNodeList);
                 } else if (TaskDependType.TASK_PRE == taskDependType) {
                     childNodeList = getFlowNodeListPre(startNode, recoveryNodeNameList, taskNodeList);
@@ -129,7 +135,6 @@ public class DagHelper {
             if (null != depList && null != startNode && depList.contains(startNode.getName())) {
                 resultList.addAll(getFlowNodeListPost(taskNode, taskNodeList));
             }
-
         }
         resultList.add(startNode);
         return resultList;
@@ -314,23 +319,46 @@ public class DagHelper {
 
         DAG<String,TaskNode,TaskNodeRelation> dag = new DAG<>();
 
-        /**
-         * add vertex
-         */
+        //add vertex
         if (CollectionUtils.isNotEmpty(processDag.getNodes())){
             for (TaskNode node : processDag.getNodes()){
                 dag.addNode(node.getName(),node);
             }
         }
 
-        /**
-         * add edge
-         */
+        //add edge
         if (CollectionUtils.isNotEmpty(processDag.getEdges())){
             for (TaskNodeRelation edge : processDag.getEdges()){
                 dag.addEdge(edge.getStartNode(),edge.getEndNode());
             }
         }
         return dag;
+    }
+
+    /**
+     * get process dag
+     * @param taskNodeList task node list
+     * @return Process dag
+     */
+    public static ProcessDag getProcessDag(List<TaskNode> taskNodeList) {
+        List<TaskNodeRelation> taskNodeRelations = new ArrayList<>();
+
+        // Traverse node information and build relationships
+        for (TaskNode taskNode : taskNodeList) {
+            String preTasks = taskNode.getPreTasks();
+            List<String> preTasksList = JSONUtils.toList(preTasks, String.class);
+
+            // If the dependency is not empty
+            if (preTasksList != null) {
+                for (String depNode : preTasksList) {
+                    taskNodeRelations.add(new TaskNodeRelation(depNode, taskNode.getName()));
+                }
+            }
+        }
+
+        ProcessDag processDag = new ProcessDag();
+        processDag.setEdges(taskNodeRelations);
+        processDag.setNodes(taskNodeList);
+        return processDag;
     }
 }

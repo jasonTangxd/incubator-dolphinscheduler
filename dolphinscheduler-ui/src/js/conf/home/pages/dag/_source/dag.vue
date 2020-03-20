@@ -25,7 +25,7 @@
              :key="v"
              v-for="(item,v) in tasksTypeList"
              @mousedown="_getDagId(v)">
-          <div data-toggle="tooltip" :title="item.description">
+          <div data-toggle="tooltip" :title="item.desc">
             <div class="icos" :class="'icos-' + v" ></div>
           </div>
         </div>
@@ -68,13 +68,21 @@
                :id="item.code"
                :key="$index"
                @click="_ckOperation(item,$event)">
-              <em :class="item.icon" data-toggle="tooltip" :title="item.description" ></em>
+              <x-button type="text" data-container="body" :icon="item.icon" v-tooltip.light="item.desc"></x-button>
             </a>
           </div>
-          <x-button type="text" icon="ans-icon-triangle-solid-right" @click="dagAutomaticLayout"></x-button>
           <x-button
-                  data-toggle="tooltip"
-                  :title="$t('Refresh DAG status')"
+                  type="primary"
+                  v-tooltip.light="$t('Format DAG')"
+                  icon="ans-icon-triangle-solid-right"
+                  size="xsmall"
+                  data-container="body"
+                  v-if="type === 'instance'"
+                  style="vertical-align: middle;"
+                  @click="dagAutomaticLayout">
+          </x-button>
+          <x-button
+                  v-tooltip.light="$t('Refresh DAG status')"
                   data-container="body"
                   style="vertical-align: middle;"
                   icon="ans-icon-refresh"
@@ -161,7 +169,7 @@
       // DAG automatic layout
       dagAutomaticLayout() {
         $('#canvas').html('')
-        
+
       // Destroy round robin
         Dag.init({
         dag: this,
@@ -189,10 +197,6 @@
           Dag.backfill(true)
           if (this.type === 'instance') {
             this._getTaskState(false).then(res => {})
-            // Round robin acquisition status
-            this.setIntervalP = setInterval(() => {
-              this._getTaskState(true).then(res => {})
-            }, 90000)
           }
         } else {
           Dag.create()
@@ -289,7 +293,7 @@
         let is = true
         let code = ''
 
-        if (!item.disable) {
+        if (item.disable) {
           return
         }
 
@@ -469,7 +473,35 @@
        */
       _createNodes ({ id, type }) {
         let self = this
+        let preNode = []
+        let rearNode = []
+        let rearList = []
+        $('div[data-targetarr*="' + id + '"]').each(function(){
+          rearNode.push($(this).attr("id"))
+        })
 
+        if (rearNode.length>0) {
+          rearNode.forEach(v => {
+            let rearobj = {}
+            rearobj.value = $(`#${v}`).find('.name-p').text()
+            rearobj.label = $(`#${v}`).find('.name-p').text()
+            rearList.push(rearobj)
+          })
+        } else {
+          rearList = []
+        }
+        let targetarr = $(`#${id}`).attr('data-targetarr')
+        if (targetarr) {
+          let nodearr = targetarr.split(',')
+          nodearr.forEach(v => {
+            let nodeobj = {}
+            nodeobj.value = $(`#${v}`).find('.name-p').text()
+            nodeobj.label = $(`#${v}`).find('.name-p').text()
+            preNode.push(nodeobj)
+          })
+        } else {
+          preNode = []
+        }
         if (eventModel) {
           eventModel.remove()
         }
@@ -482,6 +514,7 @@
         }
 
         this.taskId = id
+        type = type || self.dagBarId
 
         eventModel = this.$drawer({
           closable: false,
@@ -518,11 +551,18 @@
             },
             props: {
               id: id,
-              taskType: type || self.dagBarId,
-              self: self
+              taskType: type,
+              self: self,
+              preNode: preNode,
+              rearList: rearList
             }
           })
         })
+      },
+      removeEventModelById ($id) {
+        if(eventModel && this.taskId == $id){
+          eventModel.remove()
+        }
       }
     },
     watch: {
@@ -576,6 +616,9 @@
       clearInterval(this.setIntervalP)
     },
     destroyed () {
+      if (eventModel) {
+        eventModel.remove()
+      }
     },
     computed: {
       ...mapState('dag', ['tasks', 'locations', 'connects', 'isEditDag', 'name'])
